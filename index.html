@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>數字辨識 Pro 版</title>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white min-h-screen flex flex-col items-center p-4">
+
+    <div class="max-w-md w-full bg-slate-900 rounded-3xl overflow-hidden shadow-2xl border border-slate-800 p-6">
+        <h1 class="text-center font-bold text-blue-400 mb-4 text-lg tracking-widest">DIAGNOSTIC SCANNER v2</h1>
+
+        <div class="relative aspect-video rounded-xl overflow-hidden bg-black mb-4 border border-slate-700">
+            <video id="video" class="w-full h-full object-cover" autoplay playsinline></video>
+            <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div class="w-48 h-24 border-2 border-blue-500 rounded-lg shadow-[0_0_15px_rgba(59,130,246,0.5)]">
+                    <div class="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-white"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-black/50 p-4 rounded-xl mb-4 text-center">
+            <p class="text-[10px] text-zinc-500 uppercase mb-2">AI 預處理影像 (放大 2x + 高對比)</p>
+            <canvas id="canvas" class="mx-auto rounded bg-white w-48 h-24 border border-zinc-700"></canvas>
+            <div class="flex justify-center gap-2 mt-3">
+                <button onclick="setMode('bw')" id="btn-bw" class="text-[10px] bg-blue-600 px-3 py-1 rounded-full">高對比黑白</button>
+                <button onclick="setMode('gray')" id="btn-gray" class="text-[10px] bg-zinc-700 px-3 py-1 rounded-full">柔和灰階</button>
+            </div>
+        </div>
+
+        <div class="bg-zinc-800 rounded-2xl p-6 text-center border border-zinc-700">
+            <div id="result" class="text-6xl font-mono font-bold text-green-400 transition-all">--</div>
+            <p id="status" class="text-[10px] text-zinc-400 mt-2 uppercase tracking-tighter">正在載入模型...</p>
+            <div id="conf" class="text-[10px] text-blue-400 mt-1 font-mono"></div>
+        </div>
+
+        <button id="start-btn" disabled class="w-full mt-6 bg-zinc-700 py-4 rounded-xl font-bold transition-all opacity-50">
+            載入中...
+        </button>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const resultDiv = document.getElementById('result');
+        const statusP = document.getElementById('status');
+        const confDiv = document.getElementById('conf');
+        const startBtn = document.getElementById('start-btn');
+        
+        let isRunning = false;
+        let mode = 'bw';
+        let worker = null;
+
+        // 1. 初始化 Tesseract Worker
+        async function initOCR() {
+            try {
+                worker = await Tesseract.createWorker();
+                await worker.loadLanguage('eng');
+                await worker.initialize('eng');
+                
+                // 重要：設定只辨識數字，並強制以「單行」模式處理 (PSM 7)
+                // 這對區分 2, 3, 8 非常關鍵
+                await worker.setParameters({
+                    tessedit_char_whitelist: '0123456789',
+                    tessedit_pageseg_mode: '7', 
+                });
+
+                statusP.innerText = "系統就緒";
+                startBtn.disabled = false;
+                startBtn.innerText = "開始掃描";
+                startBtn.className = "w-full mt-6 bg-blue-600 py-4 rounded-xl font-bold active:scale-95 transition-transform cursor-pointer";
+            } catch (e) {
+                statusP.innerText = "載入失敗，請重新整理";
+            }
+        }
+
+        // 2. 切換處理模式
+        window.setMode = (m) => {
+            mode = m;
+            document.getElementById('btn-bw').className = m === 'bw' ? 'text-[10px] bg-blue-600 px-3 py-1 rounded-full' : 'text-[10px] bg-zinc-700 px-3 py-1 rounded-full';
+            document.getElementById('btn-gray').className = m === 'gray' ? 'text-[10px] bg-blue-600 px-3 py-1 rounded-full' : 'text-[10px] bg-zinc-700 px-3 py-1 rounded-full';
+        };
+
+        // 3. 啟動攝影機
+        navigator.mediaDevices.getUserMedia({ 
+            video: { 
+                facingMode: 'environment',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            } 
+        }).then(stream => { video.srcObject = stream; });
+
+        // 4. 核心辨識邏輯
+        async function scan() {
+            if (!isRunning) return;
+
+            // 提升解析度：抓取 200x100 區域但放大到 400x200
+            // 較大的文字對 Tesseract 辨識 2, 3, 8 的細節非常有幫助
+            canvas.width = 400;
+            canvas.height = 200;
+            
+            const sx = video.videoWidth / 2 - 100;
+            const sy = video.videoHeight / 2 - 50;
+            
+            ctx.drawImage(video, sx, sy, 200, 100, 0, 0, 400, 200);
+
+            // 影像預處理：提升對比度與灰階權優化
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const d = imgData.data;
+            for (let i = 0; i < d.length; i += 4) {
+                // 使用感知灰階公式
+                const avg = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+                if (mode === 'bw') {
+                    const v = avg < 120 ? 0 : 255;
+                    d[i] = d[i+1] = d[i+2] = v;
+                } else {
+                    d[i] = d[i+1] = d[i+2] = avg;
+                }
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            try {
+                const { data: { text, confidence } } = await worker.recognize(canvas);
+                const clean = text.replace(/[^0-9]/g, '');
+
+                if (clean) {
+                    resultDiv.innerText = clean;
+                    confDiv.innerText = `CONFIDENCE: ${Math.round(confidence)}%`;
+                    
+                    // 根據信心度改變顏色
+                    if (confidence > 80) resultDiv.className = "text-6xl font-mono font-bold text-green-400";
+                    else if (confidence > 50) resultDiv.className = "text-6xl font-mono font-bold text-yellow-400";
+                    else resultDiv.className = "text-6xl font-mono font-bold text-red-500";
+                }
+            } catch (e) {
+                console.error("OCR Error:", e);
+            }
+
+            // 持續掃描 (每 500ms 一次，保持流暢)
+            setTimeout(scan, 500);
+        }
+
+        startBtn.onclick = () => {
+            isRunning = !isRunning;
+            startBtn.innerText = isRunning ? "停止" : "開始掃描";
+            startBtn.classList.toggle('bg-red-600', isRunning);
+            startBtn.classList.toggle('bg-blue-600', !isRunning);
+            if (isRunning) {
+                statusP.innerText = "偵測中...";
+                scan();
+            } else {
+                statusP.innerText = "系統暫停";
+            }
+        };
+
+        // 啟動載入
+        initOCR();
+    </script>
+</body>
+</html>
